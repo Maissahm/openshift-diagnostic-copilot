@@ -1,0 +1,109 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Troubleshooting Copilot</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <main class="page">
+
+    <header class="hero">
+      <div class="logo">🤖</div>
+      <div>
+        <h1>AI Troubleshooting Copilot</h1>
+      </div>
+    </header>
+
+    <section class="welcome-section">
+      <h2>Welcome to your AI Troubleshooting Copilot</h2>
+      <p>
+        A smart assistant designed to help DevOps teams analyze OpenShift application issues
+        and generate clear diagnostic results with evidence, impact, and recommended actions.
+      </p>
+    </section>
+
+    <section class="card">
+      <h2>Describe the issue</h2>
+
+      <div class="form-grid">
+        <div class="form-group">
+          <label for="application">Application name</label>
+          <input id="application" type="text" value="backend-api" />
+        </div>
+
+        <div class="form-group">
+          <label for="namespace">Namespace</label>
+          <input id="namespace" type="text" value="production" />
+        </div>
+
+        <div class="form-group">
+          <label for="timeWindow">Time window</label>
+          <select id="timeWindow">
+            <option value="15">Last 15 minutes</option>
+            <option value="30" selected>Last 30 minutes</option>
+            <option value="60">Last 1 hour</option>
+            <option value="120">Last 2 hours</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label for="question">Question</label>
+        <textarea id="question" rows="4">Why is the app unavailable?</textarea>
+      </div>
+
+      <button id="diagnoseBtn" class="primary-btn">
+        Diagnose
+      </button>
+    </section>
+
+    <section class="card result-card">
+      <div class="result-header">
+        <h2>Diagnosis Result</h2>
+        <span id="statusBadge" class="badge badge-idle">Ready</span>
+      </div>
+
+      <div class="result-section">
+        <h3>Summary</h3>
+        <p id="summary">No diagnosis yet. Fill the form and click Diagnose.</p>
+      </div>
+
+      <div class="result-row">
+        <div class="result-box">
+          <h3>Probable Root Cause</h3>
+          <p id="rootCause">-</p>
+        </div>
+
+        <div class="result-box">
+          <h3>Confidence</h3>
+          <p id="confidence">-</p>
+        </div>
+      </div>
+
+      <div class="result-section">
+        <h3>Impact</h3>
+        <p id="impact">-</p>
+      </div>
+
+      <div class="bottom-grid">
+        <div class="result-section">
+          <h3>Evidence</h3>
+          <ul id="evidenceList"></ul>
+        </div>
+
+        <div class="result-section">
+          <h3>Recommended Actions</h3>
+          <ol id="actionsList"></ol>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="script.js"></script>
+</body>
+</html>
