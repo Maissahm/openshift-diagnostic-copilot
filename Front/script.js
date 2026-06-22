@@ -22,20 +22,7 @@ diagnoseBtn.addEventListener("click", async () => {
   diagnoseBtn.disabled = true;
 
   try {
-    /*
-      For now, we use mock data because the backend is not connected yet.
-      Later, i will replace the mockDiagnosis(requestData) line with:
-
-      const apiResponse = await fetch("http://localhost:8000/diagnose", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(requestData)
-      });
-
-      const response = await apiResponse.json();
-    */
+   
 
     const response = await mockDiagnosis(requestData);
 
