@@ -1,5 +1,7 @@
 const diagnoseBtn = document.getElementById("diagnoseBtn");
 
+const API_URL = "http://ai-copilot-backend-ai-copilot.apps.sno.fedora.test";
+
 diagnoseBtn.addEventListener("click", async () => {
   const application = document.getElementById("application").value.trim();
   const namespace = document.getElementById("namespace").value.trim();
@@ -22,7 +24,7 @@ diagnoseBtn.addEventListener("click", async () => {
   diagnoseBtn.disabled = true;
 
   try {
-    const response = await fetch("http://127.0.0.1:8000/diagnose", {
+    const response = await fetch(`${API_URL}/diagnose`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
