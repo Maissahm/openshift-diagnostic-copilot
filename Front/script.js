@@ -14,7 +14,7 @@ diagnoseBtn.addEventListener("click", async () => {
   const requestData = {
     application: application,
     namespace: namespace,
-    time_window_minutes: Number(timeWindow),
+    time_window: `${timeWindow} minutes`,
     question: question
   };
 
@@ -22,16 +22,26 @@ diagnoseBtn.addEventListener("click", async () => {
   diagnoseBtn.disabled = true;
 
   try {
-   
+    const response = await fetch("http://127.0.0.1:8000/diagnose", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(requestData)
+    });
 
-    const response = await mockDiagnosis(requestData);
+    if (!response.ok) {
+      throw new Error("Backend request failed");
+    }
 
-    displayDiagnosis(response);
+    const data = await response.json();
+
+    displayDiagnosis(data);
     setStatus("Completed", "completed");
 
   } catch (error) {
     console.error(error);
-    setStatus("Error", "error");
+    setStatus("Error: backend not reachable", "error");
   } finally {
     diagnoseBtn.disabled = false;
   }
@@ -49,21 +59,25 @@ function setStatus(text, type) {
 }
 
 function displayDiagnosis(data) {
-  document.getElementById("summary").textContent = data.summary || "-";
-  document.getElementById("rootCause").textContent = data.probable_root_cause || "-";
+  document.getElementById("summary").textContent = data.explanation || "-";
+  document.getElementById("rootCause").textContent = data.probable_cause || "-";
   document.getElementById("confidence").textContent = data.confidence || "-";
-  document.getElementById("impact").textContent = data.impact || "-";
+  document.getElementById("impact").textContent = data.status || "-";
 
   const evidenceList = document.getElementById("evidenceList");
   evidenceList.innerHTML = "";
 
-  if (Array.isArray(data.evidence)) {
-    data.evidence.forEach(item => {
-      const li = document.createElement("li");
-      li.textContent = item;
-      evidenceList.appendChild(li);
-    });
-  }
+  const evidence = [
+    "The backend received the diagnostic request successfully",
+    "The diagnosis is currently based on mock data",
+    "OpenShift, Prometheus and Alertmanager integration will be added later"
+  ];
+
+  evidence.forEach(item => {
+    const li = document.createElement("li");
+    li.textContent = item;
+    evidenceList.appendChild(li);
+  });
 
   const actionsList = document.getElementById("actionsList");
   actionsList.innerHTML = "";
@@ -75,32 +89,4 @@ function displayDiagnosis(data) {
       actionsList.appendChild(li);
     });
   }
-}
-
-function mockDiagnosis(requestData) {
-  console.log("Mock request sent:", requestData);
-
-  return new Promise(resolve => {
-    setTimeout(() => {
-      resolve({
-        summary: "The application is unavailable because it cannot connect to the database.",
-        probable_root_cause: "Database service unavailable",
-        confidence: "High",
-        impact: "Backend requests requiring database access are failing.",
-        evidence: [
-          "Route is healthy",
-          "Service has endpoints",
-          "Pods are running and ready",
-          "Database connection failures started at 14:33 UTC",
-          "DatabaseUnavailable alert is firing"
-        ],
-        recommended_actions: [
-          "Check database pod status",
-          "Check database service endpoints",
-          "Check database logs",
-          "Verify DB_HOST and DB_PORT"
-        ]
-      });
-    }, 900);
-  });
 }
