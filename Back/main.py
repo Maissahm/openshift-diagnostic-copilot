@@ -119,7 +119,57 @@ def diagnose(request: DiagnoseRequest):
                     f"No pods found with label app={request.application} or matching pod name."
                 ]
             )
+        for pod in pods:
+            pod_name = pod.metadata.name
+            pod_phase = pod.status.phase
 
+            evidence.append(f"Pod found: {pod_name}")
+            evidence.append(f"Pod phase: {pod_phase}")
+
+            ready_status = "Unknown"
+
+            for condition in pod.status.conditions or []:
+                if condition.type == "Ready":
+                    ready_status = condition.status
+
+            evidence.append(f"Pod ready status: {ready_status}")
+
+            for container_status in pod.status.container_statuses or []:
+                container_name = container_status.name
+                restart_count = container_status.restart_count
+
+                evidence.append(
+                    f"Container {container_name} restart count: {restart_count}"
+                )
+
+                state = container_status.state
+
+                if state and state.waiting:
+                    reason = state.waiting.reason
+                    message = state.waiting.message or ""
+
+                    evidence.append(
+                        f"Container {container_name} waiting reason: {reason}"
+                    )
+
+                    if message:
+                        evidence.append(message)
+
+        return DiagnoseResponse(
+            status="Pod evidence collected",
+            probable_cause="Pod-level evidence collected successfully",
+            confidence="Medium",
+            explanation=(
+                f"Pods were found for application '{request.application}' "
+                f"in namespace '{request.namespace}'. The backend collected pod status, "
+                "readiness status, restart count and container state information. "
+                "Diagnostic rules will be added in the next commits."
+            ),
+            recommended_actions=[
+                "Continue with diagnostic rules for image pull issues, CrashLoopBackOff, pod readiness and restart count."
+            ],
+            evidence=evidence
+        )
         return DiagnoseResponse(
             status="Application found",
             probable_cause="Pods were found for the application",
