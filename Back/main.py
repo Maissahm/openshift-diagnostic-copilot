@@ -49,6 +49,7 @@ def load_kubernetes_config():
         config.load_kube_config()
         return "local-kubeconfig"
 
+
 def find_application_pods(v1_api, namespace: str, application: str):
    
     pods = v1_api.list_namespaced_pod(
@@ -81,9 +82,12 @@ def health():
     return {
         "status": "healthy"
     }
+
+
 @app.post("/diagnose", response_model=DiagnoseResponse)
 def diagnose(request: DiagnoseRequest):
     evidence = []
+    recommended_actions = []
 
     try:
         config_mode = load_kubernetes_config()
@@ -111,14 +115,19 @@ def diagnose(request: DiagnoseRequest):
                 recommended_actions=[
                     f"Run: oc get pods -n {request.namespace}",
                     f"Run: oc get deployment -n {request.namespace}",
-                    "Verify that the application is deployed in the selected namespace.",
-                    "Check if the pods have the label app=<application>.",
-                    "If the deployment exists but replicas are set to 0, scale the deployment up."
+                    "Check if the application name is correct.",
+                    "Check if the pods have the label app=<application>."
                 ],
                 evidence=[
                     f"No pods found with label app={request.application} or matching pod name."
                 ]
             )
+
+        crash_loop_detected = False
+        image_pull_issue_detected = False
+        pod_not_ready_detected = False
+        high_restart_detected = False
+
         for pod in pods:
             pod_name = pod.metadata.name
             pod_phase = pod.status.phase
@@ -134,6 +143,14 @@ def diagnose(request: DiagnoseRequest):
 
             evidence.append(f"Pod ready status: {ready_status}")
 
+            if pod_phase != "Running":
+                pod_not_ready_detected = True
+                evidence.append(f"Pod {pod_name} is not running.")
+
+            if ready_status != "True":
+                pod_not_ready_detected = True
+                evidence.append(f"Pod {pod_name} is not ready.")
+
             for container_status in pod.status.container_statuses or []:
                 container_name = container_status.name
                 restart_count = container_status.restart_count
@@ -141,6 +158,12 @@ def diagnose(request: DiagnoseRequest):
                 evidence.append(
                     f"Container {container_name} restart count: {restart_count}"
                 )
+
+                if restart_count >= 3:
+                    high_restart_detected = True
+                    evidence.append(
+                        f"Container {container_name} has a high restart count."
+                    )
 
                 state = container_status.state
 
@@ -152,35 +175,101 @@ def diagnose(request: DiagnoseRequest):
                         f"Container {container_name} waiting reason: {reason}"
                     )
 
-                    if message:
+                    if reason == "CrashLoopBackOff":
+                        crash_loop_detected = True
                         evidence.append(message)
 
+                    if reason in ["ImagePullBackOff", "ErrImagePull"]:
+                        image_pull_issue_detected = True
+                        evidence.append(message)
+
+        if image_pull_issue_detected:
+            return DiagnoseResponse(
+                status="Application unavailable",
+                probable_cause="Container image pull failure",
+                confidence="High",
+                explanation=(
+                    "OpenShift found pods for the application, but at least one container "
+                    "has an image pull problem. This usually means that the image name, "
+                    "tag, registry access, or image pull permissions are incorrect."
+                ),
+                recommended_actions=[
+                    "Check the image name and tag.",
+                    "Check if the image exists in Docker Hub or the configured registry.",
+                    "Check imagePullSecrets if the registry is private.",
+                    f"Run: oc describe pod <pod-name> -n {request.namespace}"
+                ],
+                evidence=evidence
+            )
+
+        if crash_loop_detected:
+            return DiagnoseResponse(
+                status="Application unavailable",
+                probable_cause="Container is crashing repeatedly",
+                confidence="High",
+                explanation=(
+                    "OpenShift found pods for the application, but at least one container "
+                    "is in CrashLoopBackOff. This means the container starts and then crashes repeatedly."
+                ),
+                recommended_actions=[
+                    f"Run: oc logs <pod-name> -n {request.namespace}",
+                    f"Run: oc describe pod <pod-name> -n {request.namespace}",
+                    "Check application startup errors.",
+                    "Check environment variables and configuration."
+                ],
+                evidence=evidence
+            )
+
+        if pod_not_ready_detected:
+            return DiagnoseResponse(
+                status="Application degraded",
+                probable_cause="Pod is not ready",
+                confidence="Medium",
+                explanation=(
+                    "The application pod exists, but it is not fully ready. "
+                    "This may indicate a readiness probe issue, startup delay, "
+                    "or application-level problem."
+                ),
+                recommended_actions=[
+                    f"Run: oc get pods -n {request.namespace}",
+                    f"Run: oc describe pod <pod-name> -n {request.namespace}",
+                    "Check readiness probe configuration.",
+                    "Check application logs."
+                ],
+                evidence=evidence
+            )
+
+        if high_restart_detected:
+            return DiagnoseResponse(
+                status="Application unstable",
+                probable_cause="High container restart count",
+                confidence="Medium",
+                explanation=(
+                    "The application pod is running, but one or more containers have restarted several times. "
+                    "This may indicate instability, memory issues, or application errors."
+                ),
+                recommended_actions=[
+                    f"Run: oc logs <pod-name> -n {request.namespace}",
+                    f"Run: oc describe pod <pod-name> -n {request.namespace}",
+                    "Check CPU and memory limits.",
+                    "Check recent application errors."
+                ],
+                evidence=evidence
+            )
+
         return DiagnoseResponse(
-            status="Pod evidence collected",
-            probable_cause="Pod-level evidence collected successfully",
+            status="No critical pod issue detected",
+            probable_cause="Pods appear to be running and ready",
             confidence="Medium",
             explanation=(
-                f"Pods were found for application '{request.application}' "
-                f"in namespace '{request.namespace}'. The backend collected pod status, "
-                "readiness status, restart count and container state information. "
-                "Diagnostic rules will be added in the next commits."
+                f"Real OpenShift pod data was collected for application "
+                f"'{request.application}' in namespace '{request.namespace}'. "
+                "The pods appear to be running and ready."
             ),
             recommended_actions=[
-                "Continue with diagnostic rules for image pull issues, CrashLoopBackOff, pod readiness and restart count."
-            ],
-            evidence=evidence
-        )
-        return DiagnoseResponse(
-            status="Application found",
-            probable_cause="Pods were found for the application",
-            confidence="Medium",
-            explanation=(
-                f"Pods were found for application '{request.application}' "
-                f"in namespace '{request.namespace}'. Further diagnostic rules "
-                "will be added in the next commits."
-            ),
-            recommended_actions=[
-                "Continue with pod status, readiness and container state diagnostics."
+                "Check services and routes if the application is still unreachable.",
+                "Check application logs if the issue is not visible at pod level.",
+                "Next diagnostic step: verify services, endpoints and routes."
             ],
             evidence=evidence
         )
@@ -190,11 +279,15 @@ def diagnose(request: DiagnoseRequest):
             status="Diagnostic failed",
             probable_cause="OpenShift API access error",
             confidence="High",
-            explanation="The backend could not access the OpenShift API.",
+            explanation=(
+                "The backend could not access the OpenShift API. "
+                "This is usually caused by missing service account permissions."
+            ),
             recommended_actions=[
                 "Check backend service account permissions.",
                 f"Run: oc auth can-i get pods -n {request.namespace}",
-                "Give the backend service account view permissions on the namespace."
+                "Give the backend service account view permissions on the namespace.",
+                "Check backend pod logs."
             ],
             evidence=[str(api_error)]
         )
@@ -207,8 +300,8 @@ def diagnose(request: DiagnoseRequest):
             explanation="An unexpected error occurred during the diagnostic process.",
             recommended_actions=[
                 "Check backend logs.",
-                "Verify that the Kubernetes package is installed.",
-                "Verify that the backend is running correctly."
+                "Verify that the kubernetes package is installed.",
+                "Verify that the backend is running inside OpenShift."
             ],
             evidence=[str(error)]
         )
