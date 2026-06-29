@@ -102,6 +102,21 @@ def find_application_services(v1_api, namespace: str, application: str, pods):
     return matching_services
 
 
+def service_selector_matches_pods(service, pods) -> bool:
+    selector = service.spec.selector or {}
+
+    if not selector:
+        return False
+
+    for pod in pods:
+        pod_labels = pod.metadata.labels or {}
+
+        if labels_match_selector(pod_labels, selector):
+            return True
+
+    return False
+
+
 @app.get("/")
 def root():
     return {
@@ -335,21 +350,58 @@ def diagnose(request: DiagnoseRequest):
             "Services found: " + ", ".join(service.metadata.name for service in services)
         )
 
+        selector_mismatch_detected = False
+        mismatched_service_names = []
+
+        for service in services:
+            selector = service.spec.selector or {}
+
+            evidence.append(
+                f"Service {service.metadata.name} selector: {selector}"
+            )
+
+            if not service_selector_matches_pods(service, pods):
+                selector_mismatch_detected = True
+                mismatched_service_names.append(service.metadata.name)
+                evidence.append(
+                    f"Service {service.metadata.name} selector does not match the application pod labels."
+                )
+
+        if selector_mismatch_detected:
+            return DiagnoseResponse(
+                status="Application unavailable",
+                probable_cause="Service selector does not match pod labels",
+                confidence="High",
+                explanation=(
+                    "A service was found for the application, but its selector does not match "
+                    "the labels of the application pods. In this situation, the service exists, "
+                    "but it cannot correctly forward traffic to the application pods."
+                ),
+                recommended_actions=[
+                    "Update the service selector so it matches the labels of the application pods.",
+                    "Or update the pod labels so they match the service selector.",
+                    f"Run: oc get pods --show-labels -n {request.namespace}",
+                    f"Run: oc describe svc <service-name> -n {request.namespace}",
+                    f"Validate the fix with: oc get endpoints -n {request.namespace}"
+                ],
+                evidence=evidence
+            )
+
         return DiagnoseResponse(
-            status="No critical pod or service issue detected",
-            probable_cause="Pods appear to be running and a service was found",
+            status="No critical pod or service selector issue detected",
+            probable_cause="Pods appear to be running and the service selector matches pod labels",
             confidence="Medium",
             explanation=(
                 f"Real OpenShift data was collected for application "
                 f"'{request.application}' in namespace '{request.namespace}'. "
-                "The pods appear to be running and ready, and at least one service "
-                "was found for the application. The next diagnostic step is to verify "
-                "service selectors, endpoints and routes."
+                "The pods appear to be running and ready, at least one service was found, "
+                "and the service selector matches the pod labels. The next diagnostic step "
+                "is to verify endpoints and routes."
             ),
             recommended_actions=[
-                "Next diagnostic step: verify that the service selector matches pod labels.",
                 "Next diagnostic step: verify that the service has endpoints.",
-                "Next diagnostic step: verify that an OpenShift route exists."
+                "Next diagnostic step: verify that an OpenShift route exists.",
+                "Next diagnostic step: verify that the route points to the correct service."
             ],
             evidence=evidence
         )
