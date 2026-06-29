@@ -12,17 +12,16 @@ app = FastAPI(
 )
 
 app.add_middleware(
-CORSMiddleware,
-allow_origins=[
-"http://ai-copilot-frontend-ai-copilot.apps.sno.fedora.test",
-"http://localhost:8080",
-"http://127.0.0.1:8080",
-],
-allow_credentials=False,
-allow_methods=["GET", "POST", "OPTIONS"],
-allow_headers=["Content-Type"],
+    CORSMiddleware,
+    allow_origins=[
+        "http://ai-copilot-frontend-ai-copilot.apps.sno.fedora.test",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+    ],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
 )
-
 
 
 class DiagnoseRequest(BaseModel):
@@ -50,8 +49,18 @@ def load_kubernetes_config():
         return "local-kubeconfig"
 
 
+def labels_match_selector(pod_labels: dict, selector: dict) -> bool:
+    if not pod_labels or not selector:
+        return False
+
+    for key, value in selector.items():
+        if pod_labels.get(key) != value:
+            return False
+
+    return True
+
+
 def find_application_pods(v1_api, namespace: str, application: str):
-   
     pods = v1_api.list_namespaced_pod(
         namespace=namespace,
         label_selector=f"app={application}"
@@ -68,6 +77,29 @@ def find_application_pods(v1_api, namespace: str, application: str):
     ]
 
     return matching_pods
+
+
+def find_application_services(v1_api, namespace: str, application: str, pods):
+    all_services = v1_api.list_namespaced_service(namespace=namespace).items
+    pod_labels_list = [pod.metadata.labels or {} for pod in pods]
+
+    matching_services = []
+
+    for service in all_services:
+        service_name = service.metadata.name
+        selector = service.spec.selector or {}
+
+        service_name_matches = application.lower() in service_name.lower()
+        selector_matches_app = selector.get("app") == application
+        selector_matches_pods = any(
+            labels_match_selector(pod_labels, selector)
+            for pod_labels in pod_labels_list
+        )
+
+        if service_name_matches or selector_matches_app or selector_matches_pods:
+            matching_services.append(service)
+
+    return matching_services
 
 
 @app.get("/")
@@ -87,7 +119,6 @@ def health():
 @app.post("/diagnose", response_model=DiagnoseResponse)
 def diagnose(request: DiagnoseRequest):
     evidence = []
-    recommended_actions = []
 
     try:
         config_mode = load_kubernetes_config()
@@ -115,8 +146,10 @@ def diagnose(request: DiagnoseRequest):
                 recommended_actions=[
                     f"Run: oc get pods -n {request.namespace}",
                     f"Run: oc get deployment -n {request.namespace}",
+                    "Verify that the application is deployed in the selected namespace.",
                     "Check if the application name is correct.",
-                    "Check if the pods have the label app=<application>."
+                    "Check if the pods have the label app=<application>.",
+                    "If the deployment exists but replicas are set to 0, scale the deployment up."
                 ],
                 evidence=[
                     f"No pods found with label app={request.application} or matching pod name."
@@ -177,11 +210,15 @@ def diagnose(request: DiagnoseRequest):
 
                     if reason == "CrashLoopBackOff":
                         crash_loop_detected = True
-                        evidence.append(message)
+
+                        if message:
+                            evidence.append(message)
 
                     if reason in ["ImagePullBackOff", "ErrImagePull"]:
                         image_pull_issue_detected = True
-                        evidence.append(message)
+
+                        if message:
+                            evidence.append(message)
 
         if image_pull_issue_detected:
             return DiagnoseResponse(
@@ -194,10 +231,11 @@ def diagnose(request: DiagnoseRequest):
                     "tag, registry access, or image pull permissions are incorrect."
                 ),
                 recommended_actions=[
-                    "Check the image name and tag.",
-                    "Check if the image exists in Docker Hub or the configured registry.",
-                    "Check imagePullSecrets if the registry is private.",
-                    f"Run: oc describe pod <pod-name> -n {request.namespace}"
+                    "Correct the container image name or tag if it is wrong.",
+                    "Push the missing image to the configured registry if it does not exist.",
+                    "Configure the correct imagePullSecret if the registry is private.",
+                    "Restart the deployment after fixing the image configuration.",
+                    f"Validate the fix with: oc get pods -n {request.namespace}"
                 ],
                 evidence=evidence
             )
@@ -214,8 +252,10 @@ def diagnose(request: DiagnoseRequest):
                 recommended_actions=[
                     f"Run: oc logs <pod-name> -n {request.namespace}",
                     f"Run: oc describe pod <pod-name> -n {request.namespace}",
-                    "Check application startup errors.",
-                    "Check environment variables and configuration."
+                    "Fix the startup error shown in the logs.",
+                    "Check missing environment variables, ConfigMaps, Secrets or external dependencies.",
+                    "Redeploy the corrected application version or rollback to a stable image.",
+                    f"Validate the fix with: oc get pods -n {request.namespace}"
                 ],
                 evidence=evidence
             )
@@ -228,13 +268,14 @@ def diagnose(request: DiagnoseRequest):
                 explanation=(
                     "The application pod exists, but it is not fully ready. "
                     "This may indicate a readiness probe issue, startup delay, "
-                    "or application-level problem."
+                    "wrong port configuration or an application-level problem."
                 ),
                 recommended_actions=[
-                    f"Run: oc get pods -n {request.namespace}",
                     f"Run: oc describe pod <pod-name> -n {request.namespace}",
-                    "Check readiness probe configuration.",
-                    "Check application logs."
+                    "Fix the readiness probe path, port or initial delay if it is misconfigured.",
+                    "Verify that the application exposes the expected health endpoint.",
+                    "Check application logs to identify internal errors.",
+                    f"Validate the fix with: oc get pods -n {request.namespace}"
                 ],
                 evidence=evidence
             )
@@ -245,31 +286,70 @@ def diagnose(request: DiagnoseRequest):
                 probable_cause="High container restart count",
                 confidence="Medium",
                 explanation=(
-                    "The application pod is running, but one or more containers have restarted several times. "
-                    "This may indicate instability, memory issues, or application errors."
+                    "The application pod is running, but one or more containers "
+                    "have restarted several times. This may indicate instability, "
+                    "memory issues, probe problems or application errors."
                 ),
                 recommended_actions=[
                     f"Run: oc logs <pod-name> -n {request.namespace}",
                     f"Run: oc describe pod <pod-name> -n {request.namespace}",
-                    "Check CPU and memory limits.",
-                    "Check recent application errors."
+                    "Fix the cause of repeated restarts found in the logs.",
+                    "Increase memory or CPU limits if the container is being killed because of resource pressure.",
+                    "Adjust liveness probe settings if the probe is restarting the container too early.",
+                    f"Validate the fix with: oc get pods -n {request.namespace}"
                 ],
                 evidence=evidence
             )
 
+        services = find_application_services(
+            v1_api=v1,
+            namespace=request.namespace,
+            application=request.application,
+            pods=pods
+        )
+
+        if not services:
+            return DiagnoseResponse(
+                status="Application unavailable",
+                probable_cause="No service found for the application",
+                confidence="High",
+                explanation=(
+                    f"The application pods were found for '{request.application}' "
+                    f"in namespace '{request.namespace}', but no Kubernetes/OpenShift "
+                    "service was found. Without a service, traffic cannot be forwarded "
+                    "correctly to the application pods."
+                ),
+                recommended_actions=[
+                    "Create a service for the application deployment.",
+                    "Expose the deployment using the correct application port.",
+                    "Make sure the service selector matches the pod labels.",
+                    f"Run: oc get svc -n {request.namespace}",
+                    f"Validate the fix with: oc get endpoints -n {request.namespace}"
+                ],
+                evidence=evidence + [
+                    f"No service found for application {request.application}."
+                ]
+            )
+
+        evidence.append(
+            "Services found: " + ", ".join(service.metadata.name for service in services)
+        )
+
         return DiagnoseResponse(
-            status="No critical pod issue detected",
-            probable_cause="Pods appear to be running and ready",
+            status="No critical pod or service issue detected",
+            probable_cause="Pods appear to be running and a service was found",
             confidence="Medium",
             explanation=(
-                f"Real OpenShift pod data was collected for application "
+                f"Real OpenShift data was collected for application "
                 f"'{request.application}' in namespace '{request.namespace}'. "
-                "The pods appear to be running and ready."
+                "The pods appear to be running and ready, and at least one service "
+                "was found for the application. The next diagnostic step is to verify "
+                "service selectors, endpoints and routes."
             ),
             recommended_actions=[
-                "Check services and routes if the application is still unreachable.",
-                "Check application logs if the issue is not visible at pod level.",
-                "Next diagnostic step: verify services, endpoints and routes."
+                "Next diagnostic step: verify that the service selector matches pod labels.",
+                "Next diagnostic step: verify that the service has endpoints.",
+                "Next diagnostic step: verify that an OpenShift route exists."
             ],
             evidence=evidence
         )
@@ -286,6 +366,7 @@ def diagnose(request: DiagnoseRequest):
             recommended_actions=[
                 "Check backend service account permissions.",
                 f"Run: oc auth can-i get pods -n {request.namespace}",
+                f"Run: oc auth can-i get services -n {request.namespace}",
                 "Give the backend service account view permissions on the namespace.",
                 "Check backend pod logs."
             ],
