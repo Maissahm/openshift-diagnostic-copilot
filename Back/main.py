@@ -117,6 +117,25 @@ def service_selector_matches_pods(service, pods) -> bool:
     return False
 
 
+def get_service_endpoint_count(v1_api, namespace: str, service_name: str) -> int:
+    try:
+        endpoints = v1_api.read_namespaced_endpoints(
+            name=service_name,
+            namespace=namespace
+        )
+    except ApiException as error:
+        if error.status == 404:
+            return 0
+        raise
+
+    endpoint_count = 0
+
+    for subset in endpoints.subsets or []:
+        endpoint_count += len(subset.addresses or [])
+
+    return endpoint_count
+
+
 @app.get("/")
 def root():
     return {
@@ -387,21 +406,58 @@ def diagnose(request: DiagnoseRequest):
                 evidence=evidence
             )
 
+        service_without_endpoints = []
+
+        for service in services:
+            endpoint_count = get_service_endpoint_count(
+                v1_api=v1,
+                namespace=request.namespace,
+                service_name=service.metadata.name
+            )
+
+            evidence.append(
+                f"Service {service.metadata.name} endpoint count: {endpoint_count}"
+            )
+
+            if endpoint_count == 0:
+                service_without_endpoints.append(service.metadata.name)
+
+        if service_without_endpoints:
+            return DiagnoseResponse(
+                status="Application unavailable",
+                probable_cause="Service has no endpoints",
+                confidence="High",
+                explanation=(
+                    "The service exists and its selector matches the application pods, "
+                    "but the service has no endpoints. This means the service is not "
+                    "connected to any Ready pod, so traffic cannot reach the application."
+                ),
+                recommended_actions=[
+                    "Fix pod readiness if the pods are not Ready.",
+                    "Verify that the service targetPort matches the container port.",
+                    "Verify that the application container is listening on the expected port.",
+                    f"Run: oc get endpoints -n {request.namespace}",
+                    f"Run: oc describe svc <service-name> -n {request.namespace}",
+                    "Validate the fix by checking that the service endpoints are no longer empty."
+                ],
+                evidence=evidence
+            )
+
         return DiagnoseResponse(
-            status="No critical pod or service selector issue detected",
-            probable_cause="Pods appear to be running and the service selector matches pod labels",
+            status="No critical pod, service or endpoint issue detected",
+            probable_cause="Pods, service and endpoints appear to be correctly configured",
             confidence="Medium",
             explanation=(
                 f"Real OpenShift data was collected for application "
                 f"'{request.application}' in namespace '{request.namespace}'. "
-                "The pods appear to be running and ready, at least one service was found, "
-                "and the service selector matches the pod labels. The next diagnostic step "
-                "is to verify endpoints and routes."
+                "The pods appear to be running and ready, a service was found, "
+                "the service selector matches the pod labels, and the service has endpoints. "
+                "The next diagnostic step is to verify OpenShift routes."
             ),
             recommended_actions=[
-                "Next diagnostic step: verify that the service has endpoints.",
                 "Next diagnostic step: verify that an OpenShift route exists.",
-                "Next diagnostic step: verify that the route points to the correct service."
+                "Next diagnostic step: verify that the route points to the correct service.",
+                "If the application is still unreachable, check application logs and route configuration."
             ],
             evidence=evidence
         )
@@ -419,6 +475,7 @@ def diagnose(request: DiagnoseRequest):
                 "Check backend service account permissions.",
                 f"Run: oc auth can-i get pods -n {request.namespace}",
                 f"Run: oc auth can-i get services -n {request.namespace}",
+                f"Run: oc auth can-i get endpoints -n {request.namespace}",
                 "Give the backend service account view permissions on the namespace.",
                 "Check backend pod logs."
             ],
