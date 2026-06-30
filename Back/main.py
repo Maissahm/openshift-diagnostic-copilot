@@ -258,6 +258,13 @@ def diagnose(request: DiagnoseRequest):
                     f"Container {container_name} restart count: {restart_count}"
                 )
 
+                if restart_count >= 3 and ready_status != "True":
+                    crash_loop_detected = True
+                    evidence.append(
+                        f"Container {container_name} restarted {restart_count} times "
+                        "and the pod is not ready. This suggests repeated crashes."
+                    )
+
                 if restart_count >= 3:
                     high_restart_detected = True
                     evidence.append(
@@ -313,7 +320,8 @@ def diagnose(request: DiagnoseRequest):
                 confidence="High",
                 explanation=(
                     "OpenShift found pods for the application, but at least one container "
-                    "is in CrashLoopBackOff. This means the container starts and then crashes repeatedly."
+                    "is crashing repeatedly. This can appear as CrashLoopBackOff, or as "
+                    "a high restart count while the pod is still not ready."
                 ),
                 recommended_actions=[
                     f"Run: oc logs <pod-name> -n {request.namespace}",
