@@ -69,26 +69,30 @@ function displayDiagnosis(data) {
   const evidenceList = document.getElementById("evidenceList");
   evidenceList.innerHTML = "";
 
-  const evidence = [
-    "The backend received the diagnostic request successfully",
-    "The diagnosis is currently based on mock data",
-    "OpenShift, Prometheus and Alertmanager integration will be added later"
-  ];
-
-  evidence.forEach(item => {
+  if (Array.isArray(data.evidence) && data.evidence.length > 0) {
+    data.evidence.forEach(item => {
+      const li = document.createElement("li");
+      li.textContent = item;
+      evidenceList.appendChild(li);
+    });
+  } else {
     const li = document.createElement("li");
-    li.textContent = item;
+    li.textContent = "No evidence returned by the backend.";
     evidenceList.appendChild(li);
-  });
+  }
 
   const actionsList = document.getElementById("actionsList");
   actionsList.innerHTML = "";
 
-  if (Array.isArray(data.recommended_actions)) {
+  if (Array.isArray(data.recommended_actions) && data.recommended_actions.length > 0) {
     data.recommended_actions.forEach(item => {
       const li = document.createElement("li");
       li.textContent = item;
       actionsList.appendChild(li);
     });
+  } else {
+    const li = document.createElement("li");
+    li.textContent = "No recommended actions returned by the backend.";
+    actionsList.appendChild(li);
   }
 }
