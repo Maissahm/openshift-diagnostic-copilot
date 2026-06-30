@@ -136,6 +136,32 @@ def get_service_endpoint_count(v1_api, namespace: str, service_name: str) -> int
     return endpoint_count
 
 
+def find_application_routes(custom_api, namespace: str, application: str, services):
+    service_names = [service.metadata.name for service in services]
+
+    routes_response = custom_api.list_namespaced_custom_object(
+        group="route.openshift.io",
+        version="v1",
+        namespace=namespace,
+        plural="routes"
+    )
+
+    routes = routes_response.get("items", [])
+    matching_routes = []
+
+    for route in routes:
+        route_name = route.get("metadata", {}).get("name", "")
+        target_service = route.get("spec", {}).get("to", {}).get("name", "")
+
+        route_name_matches = application.lower() in route_name.lower()
+        route_targets_application_service = target_service in service_names
+
+        if route_name_matches or route_targets_application_service:
+            matching_routes.append(route)
+
+    return matching_routes
+
+
 @app.get("/")
 def root():
     return {
@@ -159,6 +185,7 @@ def diagnose(request: DiagnoseRequest):
         evidence.append(f"Kubernetes configuration loaded using: {config_mode}")
 
         v1 = client.CoreV1Api()
+        custom_api = client.CustomObjectsApi()
 
         pods = find_application_pods(
             v1_api=v1,
@@ -443,21 +470,56 @@ def diagnose(request: DiagnoseRequest):
                 evidence=evidence
             )
 
+        routes = find_application_routes(
+            custom_api=custom_api,
+            namespace=request.namespace,
+            application=request.application,
+            services=services
+        )
+
+        if not routes:
+            return DiagnoseResponse(
+                status="Application unavailable",
+                probable_cause="No route found for the application",
+                confidence="Medium",
+                explanation=(
+                    "The application pods, service and endpoints appear to be available, "
+                    "but no OpenShift route was found. If this application must be accessible "
+                    "from outside the cluster, a route is required."
+                ),
+                recommended_actions=[
+                    "Create an OpenShift route for the correct service if external access is required.",
+                    "Make sure the route targets the service connected to the application pods.",
+                    f"Run: oc get route -n {request.namespace}",
+                    "Validate the fix by opening the generated route URL in a browser."
+                ],
+                evidence=evidence + [
+                    f"No route found for application {request.application}."
+                ]
+            )
+
+        evidence.append(
+            "Routes found: " + ", ".join(
+                route.get("metadata", {}).get("name", "")
+                for route in routes
+            )
+        )
+
         return DiagnoseResponse(
-            status="No critical pod, service or endpoint issue detected",
-            probable_cause="Pods, service and endpoints appear to be correctly configured",
+            status="No critical pod, service, endpoint or route issue detected",
+            probable_cause="Pods, service, endpoints and route appear to be correctly configured",
             confidence="Medium",
             explanation=(
                 f"Real OpenShift data was collected for application "
                 f"'{request.application}' in namespace '{request.namespace}'. "
                 "The pods appear to be running and ready, a service was found, "
-                "the service selector matches the pod labels, and the service has endpoints. "
-                "The next diagnostic step is to verify OpenShift routes."
+                "the service has endpoints, and at least one OpenShift route was found. "
+                "The next diagnostic step is to verify that the route points to the correct service."
             ),
             recommended_actions=[
-                "Next diagnostic step: verify that an OpenShift route exists.",
                 "Next diagnostic step: verify that the route points to the correct service.",
-                "If the application is still unreachable, check application logs and route configuration."
+                "If the application is still unreachable, check application logs.",
+                "Check Prometheus, Alertmanager and Loki for deeper observability evidence."
             ],
             evidence=evidence
         )
@@ -476,6 +538,7 @@ def diagnose(request: DiagnoseRequest):
                 f"Run: oc auth can-i get pods -n {request.namespace}",
                 f"Run: oc auth can-i get services -n {request.namespace}",
                 f"Run: oc auth can-i get endpoints -n {request.namespace}",
+                f"Run: oc auth can-i get routes.route.openshift.io -n {request.namespace}",
                 "Give the backend service account view permissions on the namespace.",
                 "Check backend pod logs."
             ],
