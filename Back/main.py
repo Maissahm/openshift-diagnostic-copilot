@@ -505,21 +505,58 @@ def diagnose(request: DiagnoseRequest):
             )
         )
 
+        service_names = [service.metadata.name for service in services]
+        wrong_route_targets = []
+
+        for route in routes:
+            route_name = route.get("metadata", {}).get("name", "")
+            target_service = route.get("spec", {}).get("to", {}).get("name", "")
+
+            evidence.append(
+                f"Route {route_name} target service: {target_service}"
+            )
+
+            if target_service not in service_names:
+                wrong_route_targets.append(
+                    f"Route {route_name} points to service {target_service}, "
+                    f"but expected one of: {service_names}"
+                )
+
+        if wrong_route_targets:
+            return DiagnoseResponse(
+                status="Application unavailable",
+                probable_cause="Route points to the wrong service",
+                confidence="High",
+                explanation=(
+                    "An OpenShift route was found for the application, but it does not point "
+                    "to the service associated with the application pods. This means the route "
+                    "may send external traffic to the wrong backend service."
+                ),
+                recommended_actions=[
+                    "Update the route so it targets the correct application service.",
+                    "Or create a new route for the correct service.",
+                    f"Run: oc get route -n {request.namespace}",
+                    f"Run: oc describe route <route-name> -n {request.namespace}",
+                    "Validate the fix by opening the route URL again."
+                ],
+                evidence=evidence + wrong_route_targets
+            )
+
         return DiagnoseResponse(
-            status="No critical pod, service, endpoint or route issue detected",
+            status="No critical OpenShift issue detected",
             probable_cause="Pods, service, endpoints and route appear to be correctly configured",
             confidence="Medium",
             explanation=(
                 f"Real OpenShift data was collected for application "
                 f"'{request.application}' in namespace '{request.namespace}'. "
-                "The pods appear to be running and ready, a service was found, "
-                "the service has endpoints, and at least one OpenShift route was found. "
-                "The next diagnostic step is to verify that the route points to the correct service."
+                "The pods are running and ready, a service was found, the service has endpoints, "
+                "and the OpenShift route points to the expected service."
             ),
             recommended_actions=[
-                "Next diagnostic step: verify that the route points to the correct service.",
-                "If the application is still unreachable, check application logs.",
-                "Check Prometheus, Alertmanager and Loki for deeper observability evidence."
+                "If the application is still unavailable, check application-level logs.",
+                "Check Prometheus metrics for CPU, memory or availability issues.",
+                "Check Alertmanager for active alerts.",
+                "Check Loki logs for recent application errors."
             ],
             evidence=evidence
         )
