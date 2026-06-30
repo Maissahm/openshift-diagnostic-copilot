@@ -219,6 +219,7 @@ def diagnose(request: DiagnoseRequest):
 
         crash_loop_detected = False
         image_pull_issue_detected = False
+        pod_not_running_detected = False
         pod_not_ready_detected = False
         high_restart_detected = False
 
@@ -238,12 +239,16 @@ def diagnose(request: DiagnoseRequest):
             evidence.append(f"Pod ready status: {ready_status}")
 
             if pod_phase != "Running":
-                pod_not_ready_detected = True
-                evidence.append(f"Pod {pod_name} is not running.")
+                pod_not_running_detected = True
+                evidence.append(
+                    f"Pod {pod_name} is not running. Current phase: {pod_phase}."
+                )
 
-            if ready_status != "True":
+            if pod_phase == "Running" and ready_status != "True":
                 pod_not_ready_detected = True
-                evidence.append(f"Pod {pod_name} is not ready.")
+                evidence.append(
+                    f"Pod {pod_name} is running but not ready."
+                )
 
             for container_status in pod.status.container_statuses or []:
                 container_name = container_status.name
@@ -321,20 +326,46 @@ def diagnose(request: DiagnoseRequest):
                 evidence=evidence
             )
 
+        if pod_not_running_detected:
+            return DiagnoseResponse(
+                status="Application unavailable",
+                probable_cause="Pod is not running",
+                confidence="High",
+                explanation=(
+                    "At least one application pod exists, but its phase is not Running. "
+                    "This means the pod is blocked, failed, pending, or cannot start correctly. "
+                    "The problem may be related to scheduling, resources, volumes, image configuration, "
+                    "or node availability."
+                ),
+                recommended_actions=[
+                    f"Run: oc describe pod <pod-name> -n {request.namespace}",
+                    f"Run: oc get events -n {request.namespace}",
+                    "Identify the blocking reason from the pod events.",
+                    "If the pod is Pending, check scheduling, node availability and resource requests.",
+                    "If the pod has a volume issue, fix the PVC or volume configuration.",
+                    "If the pod has an image issue, correct the image name, tag or registry access.",
+                    f"Validate the fix with: oc get pods -n {request.namespace}"
+                ],
+                evidence=evidence
+            )
+
         if pod_not_ready_detected:
             return DiagnoseResponse(
                 status="Application degraded",
-                probable_cause="Pod is not ready",
+                probable_cause="Pod is running but not ready",
                 confidence="Medium",
                 explanation=(
-                    "The application pod exists, but it is not fully ready. "
-                    "This may indicate a readiness probe issue, startup delay, "
-                    "wrong port configuration or an application-level problem."
+                    "The application pod is Running, but it is not Ready. "
+                    "This means the container has started, but OpenShift does not consider "
+                    "the application ready to receive traffic. This may indicate a readiness "
+                    "probe issue, startup delay, wrong port configuration, wrong health endpoint, "
+                    "or an application-level problem."
                 ),
                 recommended_actions=[
                     f"Run: oc describe pod <pod-name> -n {request.namespace}",
                     "Fix the readiness probe path, port or initial delay if it is misconfigured.",
                     "Verify that the application exposes the expected health endpoint.",
+                    "Verify that the application listens on the same port configured in the service and readiness probe.",
                     "Check application logs to identify internal errors.",
                     f"Validate the fix with: oc get pods -n {request.namespace}"
                 ],
