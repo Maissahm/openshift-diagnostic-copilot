@@ -41,6 +41,7 @@ class DiagnoseResponse(BaseModel):
     recommended_actions: list[str]
     evidence: list[str]
 
+
 PROMETHEUS_URL = os.getenv(
     "PROMETHEUS_URL",
     "https://thanos-querier-openshift-monitoring.apps.sno.fedora.test"
@@ -48,11 +49,12 @@ PROMETHEUS_URL = os.getenv(
 
 SERVICE_ACCOUNT_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 
+
 def load_kubernetes_config():
     try:
         config.load_incluster_config()
         return "in-cluster"
-    except config.ConfigException:
+    except Exception:
         config.load_kube_config()
         return "local-kubeconfig"
 
@@ -169,9 +171,11 @@ def find_application_routes(custom_api, namespace: str, application: str, servic
 
     return matching_routes
 
+
 def get_service_account_token() -> str:
     with open(SERVICE_ACCOUNT_TOKEN_PATH, "r", encoding="utf-8") as token_file:
         return token_file.read().strip()
+
 
 
 def query_prometheus(query: str) -> dict:
@@ -201,6 +205,18 @@ def convert_time_window_to_prometheus(time_window: str) -> str:
         return "30m"
 
     return f"{minutes}m"
+
+
+def format_metric_value(value: str) -> str:
+    try:
+        numeric_value = float(value)
+
+        if numeric_value.is_integer():
+            return str(int(numeric_value))
+
+        return f"{numeric_value:.2f}"
+    except Exception:
+        return value
 
 
 def collect_prometheus_evidence(namespace: str, pods: list, time_window: str) -> list[str]:
@@ -234,6 +250,8 @@ def collect_prometheus_evidence(namespace: str, pods: list, time_window: str) ->
             for result in restart_results:
                 pod_name = result.get("metric", {}).get("pod", "unknown-pod")
                 value = result.get("value", [None, "0"])[1]
+                value = format_metric_value(value)
+
                 prometheus_evidence.append(
                     f"Prometheus: total restart count for pod {pod_name} is {value}."
                 )
@@ -254,9 +272,16 @@ def collect_prometheus_evidence(namespace: str, pods: list, time_window: str) ->
             for result in increase_results:
                 pod_name = result.get("metric", {}).get("pod", "unknown-pod")
                 value = result.get("value", [None, "0"])[1]
+                value = format_metric_value(value)
+
                 prometheus_evidence.append(
-                    f"Prometheus: restarts increased by {value} for pod {pod_name} during the last {prometheus_window}."
+                    f"Prometheus: restarts increased by {value} for pod {pod_name} "
+                    f"during the last {prometheus_window}."
                 )
+        else:
+            prometheus_evidence.append(
+                f"Prometheus: no restart increase detected during the last {prometheus_window}."
+            )
 
         readiness_query = (
             f'kube_pod_status_ready'
@@ -276,6 +301,10 @@ def collect_prometheus_evidence(namespace: str, pods: list, time_window: str) ->
                 prometheus_evidence.append(
                     f"Prometheus: pod {pod_name} readiness metric indicates {readiness_status}."
                 )
+        else:
+            prometheus_evidence.append(
+                "Prometheus: no readiness metric found for the application pods."
+            )
 
     except Exception as error:
         prometheus_evidence.append(
@@ -284,24 +313,7 @@ def collect_prometheus_evidence(namespace: str, pods: list, time_window: str) ->
 
     return prometheus_evidence
 
-def get_service_account_token() -> str:
-    with open(SERVICE_ACCOUNT_TOKEN_PATH, "r", encoding="utf-8") as token_file:
-        return token_file.read().strip()
-    
-def query_prometheus(query: str) -> dict:
-    token = get_service_account_token()
 
-    response = requests.get(
-        f"{PROMETHEUS_URL}/api/v1/query",
-        headers={"Authorization": f"Bearer {token}"},
-        params={"query": query},
-        verify=False,
-        timeout=10
-    )
-
-    response.raise_for_status()
-    return response.json()
-    
 @app.get("/")
 def root():
     return {
@@ -352,7 +364,7 @@ def diagnose(request: DiagnoseRequest):
                     "Check if the pods have the label app=<application>.",
                     "If the deployment exists but replicas are set to 0, scale the deployment up."
                 ],
-                evidence=[
+                evidence=evidence + [
                     f"No pods found with label app={request.application} or matching pod name."
                 ]
             )
@@ -432,6 +444,14 @@ def diagnose(request: DiagnoseRequest):
 
                         if message:
                             evidence.append(message)
+
+        prometheus_evidence = collect_prometheus_evidence(
+            namespace=request.namespace,
+            pods=pods,
+            time_window=request.time_window
+        )
+
+        evidence.extend(prometheus_evidence)
 
         if image_pull_issue_detected:
             return DiagnoseResponse(
@@ -576,7 +596,6 @@ def diagnose(request: DiagnoseRequest):
         )
 
         selector_mismatch_detected = False
-        mismatched_service_names = []
 
         for service in services:
             selector = service.spec.selector or {}
@@ -587,7 +606,6 @@ def diagnose(request: DiagnoseRequest):
 
             if not service_selector_matches_pods(service, pods):
                 selector_mismatch_detected = True
-                mismatched_service_names.append(service.metadata.name)
                 evidence.append(
                     f"Service {service.metadata.name} selector does not match the application pod labels."
                 )
@@ -770,7 +788,8 @@ def diagnose(request: DiagnoseRequest):
             recommended_actions=[
                 "Check backend logs.",
                 "Verify that the kubernetes package is installed.",
-                "Verify that the backend is running inside OpenShift."
+                "Verify that the backend is running inside OpenShift.",
+                "Verify that Prometheus/Thanos URL and permissions are correctly configured."
             ],
             evidence=[str(error)]
         )
