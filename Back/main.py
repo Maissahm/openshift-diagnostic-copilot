@@ -169,7 +169,125 @@ def find_application_routes(custom_api, namespace: str, application: str, servic
 
     return matching_routes
 
+def get_service_account_token() -> str:
+    with open(SERVICE_ACCOUNT_TOKEN_PATH, "r", encoding="utf-8") as token_file:
+        return token_file.read().strip()
 
+
+def query_prometheus(query: str) -> dict:
+    token = get_service_account_token()
+
+    response = requests.get(
+        f"{PROMETHEUS_URL}/api/v1/query",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"query": query},
+        verify=False,
+        timeout=10
+    )
+
+    response.raise_for_status()
+    return response.json()
+
+
+def convert_time_window_to_prometheus(time_window: str) -> str:
+    match = re.search(r"\d+", time_window)
+
+    if not match:
+        return "30m"
+
+    minutes = int(match.group())
+
+    if minutes <= 0:
+        return "30m"
+
+    return f"{minutes}m"
+
+
+def collect_prometheus_evidence(namespace: str, pods: list, time_window: str) -> list[str]:
+    prometheus_evidence = []
+
+    if not pods:
+        return prometheus_evidence
+
+    pod_names = [
+        pod.metadata.name
+        for pod in pods
+        if pod.metadata and pod.metadata.name
+    ]
+
+    if not pod_names:
+        return prometheus_evidence
+
+    pod_regex = "|".join([re.escape(pod_name) for pod_name in pod_names])
+    prometheus_window = convert_time_window_to_prometheus(time_window)
+
+    try:
+        restart_query = (
+            f'sum by (pod) (kube_pod_container_status_restarts_total'
+            f'{{namespace="{namespace}", pod=~"{pod_regex}"}})'
+        )
+
+        restart_data = query_prometheus(restart_query)
+        restart_results = restart_data.get("data", {}).get("result", [])
+
+        if restart_results:
+            for result in restart_results:
+                pod_name = result.get("metric", {}).get("pod", "unknown-pod")
+                value = result.get("value", [None, "0"])[1]
+                prometheus_evidence.append(
+                    f"Prometheus: total restart count for pod {pod_name} is {value}."
+                )
+        else:
+            prometheus_evidence.append(
+                "Prometheus: no restart metric found for the application pods."
+            )
+
+        restart_increase_query = (
+            f'sum by (pod) (increase(kube_pod_container_status_restarts_total'
+            f'{{namespace="{namespace}", pod=~"{pod_regex}"}}[{prometheus_window}]))'
+        )
+
+        restart_increase_data = query_prometheus(restart_increase_query)
+        increase_results = restart_increase_data.get("data", {}).get("result", [])
+
+        if increase_results:
+            for result in increase_results:
+                pod_name = result.get("metric", {}).get("pod", "unknown-pod")
+                value = result.get("value", [None, "0"])[1]
+                prometheus_evidence.append(
+                    f"Prometheus: restarts increased by {value} for pod {pod_name} during the last {prometheus_window}."
+                )
+
+        readiness_query = (
+            f'kube_pod_status_ready'
+            f'{{namespace="{namespace}", pod=~"{pod_regex}", condition="true"}}'
+        )
+
+        readiness_data = query_prometheus(readiness_query)
+        readiness_results = readiness_data.get("data", {}).get("result", [])
+
+        if readiness_results:
+            for result in readiness_results:
+                pod_name = result.get("metric", {}).get("pod", "unknown-pod")
+                value = result.get("value", [None, "0"])[1]
+
+                readiness_status = "ready" if value == "1" else "not ready"
+
+                prometheus_evidence.append(
+                    f"Prometheus: pod {pod_name} readiness metric indicates {readiness_status}."
+                )
+
+    except Exception as error:
+        prometheus_evidence.append(
+            f"Prometheus: metrics could not be collected. Error: {str(error)}"
+        )
+
+    return prometheus_evidence
+
+def get_service_account_token() -> str:
+    with open(SERVICE_ACCOUNT_TOKEN_PATH, "r", encoding="utf-8") as token_file:
+        return token_file.read().strip()
+    
 @app.get("/")
 def root():
     return {
