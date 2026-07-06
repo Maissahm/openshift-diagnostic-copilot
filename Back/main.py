@@ -3,7 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
-
+import os
+import re
+import requests
 
 app = FastAPI(
     title="OpenShift Diagnostic Copilot API",
@@ -39,6 +41,12 @@ class DiagnoseResponse(BaseModel):
     recommended_actions: list[str]
     evidence: list[str]
 
+PROMETHEUS_URL = os.getenv(
+    "PROMETHEUS_URL",
+    "https://thanos-querier-openshift-monitoring.apps.sno.fedora.test"
+)
+
+SERVICE_ACCOUNT_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 
 def load_kubernetes_config():
     try:
