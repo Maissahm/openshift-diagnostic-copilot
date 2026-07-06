@@ -288,6 +288,20 @@ def get_service_account_token() -> str:
     with open(SERVICE_ACCOUNT_TOKEN_PATH, "r", encoding="utf-8") as token_file:
         return token_file.read().strip()
     
+def query_prometheus(query: str) -> dict:
+    token = get_service_account_token()
+
+    response = requests.get(
+        f"{PROMETHEUS_URL}/api/v1/query",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"query": query},
+        verify=False,
+        timeout=10
+    )
+
+    response.raise_for_status()
+    return response.json()
+    
 @app.get("/")
 def root():
     return {
