@@ -234,13 +234,14 @@ def collect_prometheus_evidence(namespace: str, pods: list, time_window: str) ->
     if not pod_names:
         return prometheus_evidence
 
-    pod_regex = "|".join([re.escape(pod_name) for pod_name in pod_names])
+    pod_regex = "|".join(pod_names)
     prometheus_window = convert_time_window_to_prometheus(time_window)
 
     try:
+      
         restart_query = (
             f'sum by (pod) (kube_pod_container_status_restarts_total'
-            f'{{namespace="{namespace}", pod=~"{pod_regex}"}})'
+            f'{{namespace="{namespace}",pod=~"{pod_regex}"}})'
         )
 
         restart_data = query_prometheus(restart_query)
@@ -262,7 +263,7 @@ def collect_prometheus_evidence(namespace: str, pods: list, time_window: str) ->
 
         restart_increase_query = (
             f'sum by (pod) (increase(kube_pod_container_status_restarts_total'
-            f'{{namespace="{namespace}", pod=~"{pod_regex}"}}[{prometheus_window}]))'
+            f'{{namespace="{namespace}",pod=~"{pod_regex}"}}[{prometheus_window}]))'
         )
 
         restart_increase_data = query_prometheus(restart_increase_query)
@@ -285,7 +286,7 @@ def collect_prometheus_evidence(namespace: str, pods: list, time_window: str) ->
 
         readiness_query = (
             f'kube_pod_status_ready'
-            f'{{namespace="{namespace}", pod=~"{pod_regex}", condition="true"}}'
+            f'{{namespace="{namespace}",pod=~"{pod_regex}",condition="true"}}'
         )
 
         readiness_data = query_prometheus(readiness_query)
@@ -306,13 +307,66 @@ def collect_prometheus_evidence(namespace: str, pods: list, time_window: str) ->
                 "Prometheus: no readiness metric found for the application pods."
             )
 
+        cpu_query = (
+            f'sum by (pod) (rate(container_cpu_usage_seconds_total'
+            f'{{namespace="{namespace}",pod=~"{pod_regex}",container!="",image!=""}}[5m]))'
+        )
+
+        cpu_data = query_prometheus(cpu_query)
+        cpu_results = cpu_data.get("data", {}).get("result", [])
+
+        if cpu_results:
+            for result in cpu_results:
+                pod_name = result.get("metric", {}).get("pod", "unknown-pod")
+                value = result.get("value", [None, "0"])[1]
+
+                try:
+                    cpu_millicores = float(value) * 1000
+                    cpu_text = f"{cpu_millicores:.2f} millicores"
+                except Exception:
+                    cpu_text = value
+
+                prometheus_evidence.append(
+                    f"Prometheus: CPU usage for pod {pod_name} is {cpu_text}."
+                )
+        else:
+            prometheus_evidence.append(
+                "Prometheus: no CPU usage metric found for the application pods."
+            )
+
+        memory_query = (
+            f'sum by (pod) (container_memory_working_set_bytes'
+            f'{{namespace="{namespace}",pod=~"{pod_regex}",container!="",image!=""}}) / 1024 / 1024'
+        )
+
+        memory_data = query_prometheus(memory_query)
+        memory_results = memory_data.get("data", {}).get("result", [])
+
+        if memory_results:
+            for result in memory_results:
+                pod_name = result.get("metric", {}).get("pod", "unknown-pod")
+                value = result.get("value", [None, "0"])[1]
+
+                try:
+                    memory_mib = float(value)
+                    memory_text = f"{memory_mib:.2f} MiB"
+                except Exception:
+                    memory_text = value
+
+                prometheus_evidence.append(
+                    f"Prometheus: memory usage for pod {pod_name} is {memory_text}."
+                )
+        else:
+            prometheus_evidence.append(
+                "Prometheus: no memory usage metric found for the application pods."
+            )
+
     except Exception as error:
         prometheus_evidence.append(
             f"Prometheus: metrics could not be collected. Error: {str(error)}"
         )
 
     return prometheus_evidence
-
 
 @app.get("/")
 def root():
