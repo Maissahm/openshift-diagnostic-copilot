@@ -1,11 +1,10 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>AI Troubleshooting Copilot</title>
-  <link rel="stylesheet" href="style.css" />
+ <link rel="stylesheet" href="style.css?v=11" />
 </head>
 <body>
 
@@ -100,10 +99,33 @@
           <ol id="actionsList"></ol>
         </div>
       </div>
+
+      <!-- Safe Automatic Fix section -->
+<div class="auto-fix-card">
+  <div class="auto-fix-header">
+    <h3>Safe Automatic Fix</h3>
+
+    <span id="resolutionFlag" class="resolution-flag manual">
+      Manual intervention required
+    </span>
+  </div>
+
+  <p id="autoFixReason" class="auto-fix-reason">
+    Run a diagnosis to check if automatic correction is available.
+  </p>
+
+  <div class="auto-fix-actions">
+    <button id="autoFixButton" class="auto-fix-button" disabled>
+      Automatic Fix Unavailable
+    </button>
+  </div>
+
+  <div id="autoFixResult" class="auto-fix-result"></div>
+</div>
     </section>
 
   </main>
 
- <script src="script.js?v=8"></script>
+  <script src="script.js?v=10"></script>
 </body>
 </html>

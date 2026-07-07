@@ -1,11 +1,15 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
+from datetime import datetime, timezone
+from typing import Optional, Literal
+import time
 import os
 import re
 import requests
+
 
 app = FastAPI(
     title="OpenShift Diagnostic Copilot API",
@@ -33,12 +37,81 @@ class DiagnoseRequest(BaseModel):
     question: str
 
 
+class AutoFixInfo(BaseModel):
+    available: bool
+    action: Optional[str] = None
+    target_kind: Optional[str] = None
+    target_name: Optional[str] = None
+    button_label: str
+    resolution_status: Literal[
+        "unresolved",
+        "resolved",
+        "fixing",
+        "manual_required"
+    ]
+    flag_label: str
+    reason: str
+
+
+def manual_auto_fix(
+    reason: str = "This issue requires manual DevOps intervention."
+) -> AutoFixInfo:
+    return AutoFixInfo(
+        available=False,
+        action=None,
+        target_kind=None,
+        target_name=None,
+        button_label="Automatic Fix Unavailable",
+        resolution_status="manual_required",
+        flag_label="Manual intervention required",
+        reason=reason
+    )
+
+
+def available_auto_fix(
+    action: str,
+    target_kind: str,
+    target_name: str,
+    reason: str
+) -> AutoFixInfo:
+    return AutoFixInfo(
+        available=True,
+        action=action,
+        target_kind=target_kind,
+        target_name=target_name,
+        button_label="Automatic Fix",
+        resolution_status="unresolved",
+        flag_label="Unresolved",
+        reason=reason
+    )
+
+
 class DiagnoseResponse(BaseModel):
     status: str
     probable_cause: str
     confidence: str
     explanation: str
     recommended_actions: list[str]
+    evidence: list[str]
+    auto_fix: AutoFixInfo = Field(default_factory=manual_auto_fix)
+
+
+class AutoFixRequest(BaseModel):
+    application: str
+    namespace: str
+    action: str
+    target_kind: str
+    target_name: str
+
+
+class AutoFixResponse(BaseModel):
+    status: str
+    resolution_status: Literal["resolved", "unresolved"]
+    flag_label: str
+    message: str
+    executed_action: str
+    target_kind: str
+    target_name: str
     evidence: list[str]
 
 
@@ -48,6 +121,18 @@ PROMETHEUS_URL = os.getenv(
 )
 
 SERVICE_ACCOUNT_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+
+def validate_k8s_name(value: str, field_name: str) -> str:
+    pattern = r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+
+    if not value or not re.match(pattern, value):
+        raise ValueError(
+            f"Invalid {field_name}: '{value}'. "
+            "Only lowercase letters, numbers and hyphens are allowed."
+        )
+
+    return value
 
 
 def load_kubernetes_config():
@@ -68,6 +153,127 @@ def labels_match_selector(pod_labels: dict, selector: dict) -> bool:
             return False
 
     return True
+
+
+def labels_match_match_expressions(pod_labels: dict, match_expressions: list) -> bool:
+    if not match_expressions:
+        return True
+
+    for expression in match_expressions:
+        key = expression.key
+        operator = expression.operator
+        values = expression.values or []
+
+        if operator == "In":
+            if pod_labels.get(key) not in values:
+                return False
+
+        elif operator == "NotIn":
+            if pod_labels.get(key) in values:
+                return False
+
+        elif operator == "Exists":
+            if key not in pod_labels:
+                return False
+
+        elif operator == "DoesNotExist":
+            if key in pod_labels:
+                return False
+
+    return True
+
+
+def deployment_matches_pods(deployment, pods) -> bool:
+    selector = deployment.spec.selector
+
+    match_labels = selector.match_labels or {}
+    match_expressions = selector.match_expressions or []
+
+    for pod in pods:
+        pod_labels = pod.metadata.labels or {}
+
+        if labels_match_selector(
+            pod_labels,
+            match_labels
+        ) and labels_match_match_expressions(
+            pod_labels,
+            match_expressions
+        ):
+            return True
+
+    return False
+
+
+def find_application_deployments(apps_api, namespace: str, application: str, pods=None):
+    deployments = apps_api.list_namespaced_deployment(namespace=namespace).items
+    pods = pods or []
+
+    matching_deployments = []
+
+    for deployment in deployments:
+        deployment_name = deployment.metadata.name
+        deployment_labels = deployment.metadata.labels or {}
+
+        name_matches = application.lower() in deployment_name.lower()
+        label_matches = deployment_labels.get("app") == application
+        selector_matches_pods = deployment_matches_pods(deployment, pods) if pods else False
+
+        if name_matches or label_matches or selector_matches_pods:
+            matching_deployments.append(deployment)
+
+    return matching_deployments
+
+
+def get_first_matching_deployment_name(
+    apps_api,
+    namespace: str,
+    application: str,
+    pods=None
+) -> Optional[str]:
+    deployments = find_application_deployments(
+        apps_api=apps_api,
+        namespace=namespace,
+        application=application,
+        pods=pods or []
+    )
+
+    if not deployments:
+        return None
+
+    return deployments[0].metadata.name
+
+
+def verify_deployment_recovered(
+    apps_api,
+    v1_api,
+    namespace: str,
+    deployment_name: str,
+    timeout_seconds: int = 90
+):
+    evidence = []
+    deadline = time.time() + timeout_seconds
+
+    while time.time() < deadline:
+        deployment = apps_api.read_namespaced_deployment(
+            name=deployment_name,
+            namespace=namespace
+        )
+
+        desired_replicas = deployment.spec.replicas or 0
+        available_replicas = deployment.status.available_replicas or 0
+        ready_replicas = deployment.status.ready_replicas or 0
+
+        evidence.append(
+            f"Deployment {deployment_name}: desired={desired_replicas}, "
+            f"ready={ready_replicas}, available={available_replicas}"
+        )
+
+        if desired_replicas > 0 and available_replicas >= 1 and ready_replicas >= 1:
+            return True, evidence
+
+        time.sleep(5)
+
+    return False, evidence
 
 
 def find_application_pods(v1_api, namespace: str, application: str):
@@ -177,7 +383,6 @@ def get_service_account_token() -> str:
         return token_file.read().strip()
 
 
-
 def query_prometheus(query: str) -> dict:
     token = get_service_account_token()
 
@@ -238,7 +443,6 @@ def collect_prometheus_evidence(namespace: str, pods: list, time_window: str) ->
     prometheus_window = convert_time_window_to_prometheus(time_window)
 
     try:
-      
         restart_query = (
             f'sum by (pod) (kube_pod_container_status_restarts_total'
             f'{{namespace="{namespace}",pod=~"{pod_regex}"}})'
@@ -368,6 +572,7 @@ def collect_prometheus_evidence(namespace: str, pods: list, time_window: str) ->
 
     return prometheus_evidence
 
+
 @app.get("/")
 def root():
     return {
@@ -387,10 +592,14 @@ def diagnose(request: DiagnoseRequest):
     evidence = []
 
     try:
+        request.application = validate_k8s_name(request.application, "application")
+        request.namespace = validate_k8s_name(request.namespace, "namespace")
+
         config_mode = load_kubernetes_config()
         evidence.append(f"Kubernetes configuration loaded using: {config_mode}")
 
         v1 = client.CoreV1Api()
+        apps_v1 = client.AppsV1Api()
         custom_api = client.CustomObjectsApi()
 
         pods = find_application_pods(
@@ -400,6 +609,58 @@ def diagnose(request: DiagnoseRequest):
         )
 
         if not pods:
+            deployments = find_application_deployments(
+                apps_api=apps_v1,
+                namespace=request.namespace,
+                application=request.application,
+                pods=[]
+            )
+
+            scaled_to_zero_deployment = None
+
+            for deployment in deployments:
+                replicas = deployment.spec.replicas or 0
+
+                evidence.append(
+                    f"Deployment found: {deployment.metadata.name}, replicas={replicas}"
+                )
+
+                if replicas == 0:
+                    scaled_to_zero_deployment = deployment
+                    break
+
+            if scaled_to_zero_deployment:
+                deployment_name = scaled_to_zero_deployment.metadata.name
+
+                return DiagnoseResponse(
+                    status="Application unavailable",
+                    probable_cause="Deployment is scaled to zero",
+                    confidence="High",
+                    explanation=(
+                        f"No pods were found for application '{request.application}', "
+                        f"but a matching deployment '{deployment_name}' exists with replicas set to 0. "
+                        "This means the application is deployed but currently scaled down."
+                    ),
+                    recommended_actions=[
+                        "Scale the deployment back to one replica.",
+                        f"Run: oc scale deployment/{deployment_name} --replicas=1 -n {request.namespace}",
+                        f"Validate the fix with: oc get pods -n {request.namespace}"
+                    ],
+                    evidence=evidence + [
+                        f"No pods found for application {request.application}.",
+                        f"Deployment {deployment_name} has replicas=0."
+                    ],
+                    auto_fix=available_auto_fix(
+                        action="scale_deployment_to_one",
+                        target_kind="deployment",
+                        target_name=deployment_name,
+                        reason=(
+                            "The application has a matching deployment with zero replicas. "
+                            "This is a simple issue that the Copilot can correct automatically."
+                        )
+                    )
+                )
+
             return DiagnoseResponse(
                 status="Application unavailable",
                 probable_cause="No pods found for the application",
@@ -420,7 +681,10 @@ def diagnose(request: DiagnoseRequest):
                 ],
                 evidence=evidence + [
                     f"No pods found with label app={request.application} or matching pod name."
-                ]
+                ],
+                auto_fix=manual_auto_fix(
+                    "No matching deployment scaled to zero was found. Automatic correction is not safe."
+                )
             )
 
         crash_loop_detected = False
@@ -572,6 +836,28 @@ def diagnose(request: DiagnoseRequest):
             )
 
         if pod_not_ready_detected:
+            deployment_name = get_first_matching_deployment_name(
+                apps_api=apps_v1,
+                namespace=request.namespace,
+                application=request.application,
+                pods=pods
+            )
+
+            if deployment_name:
+                auto_fix = available_auto_fix(
+                    action="restart_deployment",
+                    target_kind="deployment",
+                    target_name=deployment_name,
+                    reason=(
+                        "The pod is running but not ready, and a matching deployment was found. "
+                        "The Copilot can try a safe deployment restart without changing configuration."
+                    )
+                )
+            else:
+                auto_fix = manual_auto_fix(
+                    "The pod is not ready, but no matching deployment was found. Automatic correction is not safe."
+                )
+
             return DiagnoseResponse(
                 status="Application degraded",
                 probable_cause="Pod is running but not ready",
@@ -591,7 +877,8 @@ def diagnose(request: DiagnoseRequest):
                     "Check application logs to identify internal errors.",
                     f"Validate the fix with: oc get pods -n {request.namespace}"
                 ],
-                evidence=evidence
+                evidence=evidence,
+                auto_fix=auto_fix
             )
 
         if high_restart_detected:
@@ -845,5 +1132,250 @@ def diagnose(request: DiagnoseRequest):
                 "Verify that the backend is running inside OpenShift.",
                 "Verify that Prometheus/Thanos URL and permissions are correctly configured."
             ],
+            evidence=[str(error)]
+        )
+
+
+@app.post("/auto-fix", response_model=AutoFixResponse)
+def auto_fix(request: AutoFixRequest):
+    evidence = []
+
+    allowed_actions = [
+        "restart_deployment",
+        "scale_deployment_to_one"
+    ]
+
+    try:
+        request.application = validate_k8s_name(request.application, "application")
+        request.namespace = validate_k8s_name(request.namespace, "namespace")
+        request.target_name = validate_k8s_name(request.target_name, "target_name")
+    except Exception as error:
+        return AutoFixResponse(
+            status="Rejected",
+            resolution_status="unresolved",
+            flag_label="Unresolved",
+            message=str(error),
+            executed_action=request.action,
+            target_kind=request.target_kind,
+            target_name=request.target_name,
+            evidence=[str(error)]
+        )
+
+    if request.action not in allowed_actions:
+        return AutoFixResponse(
+            status="Rejected",
+            resolution_status="unresolved",
+            flag_label="Unresolved",
+            message="This action is not allowed for automatic correction.",
+            executed_action=request.action,
+            target_kind=request.target_kind,
+            target_name=request.target_name,
+            evidence=[f"Rejected action: {request.action}"]
+        )
+
+    if request.target_kind != "deployment":
+        return AutoFixResponse(
+            status="Rejected",
+            resolution_status="unresolved",
+            flag_label="Unresolved",
+            message="Automatic correction is only allowed for deployments.",
+            executed_action=request.action,
+            target_kind=request.target_kind,
+            target_name=request.target_name,
+            evidence=[f"Rejected target kind: {request.target_kind}"]
+        )
+
+    try:
+        config_mode = load_kubernetes_config()
+        evidence.append(f"Kubernetes configuration loaded using: {config_mode}")
+
+        v1 = client.CoreV1Api()
+        apps_v1 = client.AppsV1Api()
+
+        pods = find_application_pods(
+            v1_api=v1,
+            namespace=request.namespace,
+            application=request.application
+        )
+
+        matching_deployments = find_application_deployments(
+            apps_api=apps_v1,
+            namespace=request.namespace,
+            application=request.application,
+            pods=pods
+        )
+
+        matching_deployment_names = [
+            deployment.metadata.name
+            for deployment in matching_deployments
+        ]
+
+        if request.target_name not in matching_deployment_names:
+            return AutoFixResponse(
+                status="Rejected",
+                resolution_status="unresolved",
+                flag_label="Unresolved",
+                message=(
+                    "The requested deployment does not match the diagnosed application. "
+                    "Automatic correction was rejected for safety."
+                ),
+                executed_action=request.action,
+                target_kind=request.target_kind,
+                target_name=request.target_name,
+                evidence=evidence + [
+                    f"Requested target: {request.target_name}",
+                    f"Matching deployments for application {request.application}: {matching_deployment_names}"
+                ]
+            )
+
+        deployment = apps_v1.read_namespaced_deployment(
+            name=request.target_name,
+            namespace=request.namespace
+        )
+
+        evidence.append(
+            f"Deployment found before correction: {deployment.metadata.name}"
+        )
+
+        if request.action == "scale_deployment_to_one":
+            current_replicas = deployment.spec.replicas or 0
+
+            evidence.append(
+                f"Current replica count for deployment {request.target_name}: {current_replicas}"
+            )
+
+            if current_replicas != 0:
+                return AutoFixResponse(
+                    status="Skipped",
+                    resolution_status="unresolved",
+                    flag_label="Unresolved",
+                    message=(
+                        "The deployment is not scaled to zero anymore. "
+                        "Automatic scale correction was skipped."
+                    ),
+                    executed_action=request.action,
+                    target_kind=request.target_kind,
+                    target_name=request.target_name,
+                    evidence=evidence
+                )
+
+            apps_v1.patch_namespaced_deployment_scale(
+                name=request.target_name,
+                namespace=request.namespace,
+                body={
+                    "spec": {
+                        "replicas": 1
+                    }
+                }
+            )
+
+            evidence.append(
+                f"Executed correction: scaled deployment/{request.target_name} to 1 replica."
+            )
+
+        elif request.action == "restart_deployment":
+            desired_replicas = deployment.spec.replicas or 0
+
+            evidence.append(
+                f"Current desired replicas for deployment {request.target_name}: {desired_replicas}"
+            )
+
+            if desired_replicas == 0:
+                return AutoFixResponse(
+                    status="Rejected",
+                    resolution_status="unresolved",
+                    flag_label="Unresolved",
+                    message=(
+                        "The deployment has zero replicas. Restart is not useful. "
+                        "Use scale correction instead."
+                    ),
+                    executed_action=request.action,
+                    target_kind=request.target_kind,
+                    target_name=request.target_name,
+                    evidence=evidence
+                )
+
+            restarted_at = datetime.now(timezone.utc).isoformat()
+
+            patch_body = {
+                "spec": {
+                    "template": {
+                        "metadata": {
+                            "annotations": {
+                                "ai-copilot/restarted-at": restarted_at
+                            }
+                        }
+                    }
+                }
+            }
+
+            apps_v1.patch_namespaced_deployment(
+                name=request.target_name,
+                namespace=request.namespace,
+                body=patch_body
+            )
+
+            evidence.append(
+                f"Executed correction: restarted deployment/{request.target_name} "
+                f"using annotation ai-copilot/restarted-at={restarted_at}."
+            )
+
+        recovered, verification_evidence = verify_deployment_recovered(
+            apps_api=apps_v1,
+            v1_api=v1,
+            namespace=request.namespace,
+            deployment_name=request.target_name,
+            timeout_seconds=90
+        )
+
+        evidence.extend(verification_evidence)
+
+        if recovered:
+            return AutoFixResponse(
+                status="Auto-fix completed",
+                resolution_status="resolved",
+                flag_label="Resolved",
+                message="Automatic correction completed successfully. The deployment is now healthy.",
+                executed_action=request.action,
+                target_kind=request.target_kind,
+                target_name=request.target_name,
+                evidence=evidence
+            )
+
+        return AutoFixResponse(
+            status="Auto-fix executed but not resolved",
+            resolution_status="unresolved",
+            flag_label="Unresolved",
+            message=(
+                "The automatic correction was executed, but the deployment did not become healthy "
+                "within the verification timeout."
+            ),
+            executed_action=request.action,
+            target_kind=request.target_kind,
+            target_name=request.target_name,
+            evidence=evidence
+        )
+
+    except ApiException as api_error:
+        return AutoFixResponse(
+            status="Auto-fix failed",
+            resolution_status="unresolved",
+            flag_label="Unresolved",
+            message="OpenShift API error during automatic correction.",
+            executed_action=request.action,
+            target_kind=request.target_kind,
+            target_name=request.target_name,
+            evidence=[str(api_error)]
+        )
+
+    except Exception as error:
+        return AutoFixResponse(
+            status="Auto-fix failed",
+            resolution_status="unresolved",
+            flag_label="Unresolved",
+            message="Unexpected backend error during automatic correction.",
+            executed_action=request.action,
+            target_kind=request.target_kind,
+            target_name=request.target_name,
             evidence=[str(error)]
         )
