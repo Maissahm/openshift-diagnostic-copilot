@@ -378,6 +378,100 @@ def find_application_routes(custom_api, namespace: str, application: str, servic
     return matching_routes
 
 
+def create_route_for_service(
+    custom_api,
+    v1_api,
+    namespace: str,
+    application: str,
+    service_name: str
+):
+    evidence = []
+
+    try:
+        service = v1_api.read_namespaced_service(
+            name=service_name,
+            namespace=namespace
+        )
+
+        evidence.append(f"Service found before route creation: {service_name}")
+
+        service_ports = service.spec.ports or []
+
+        if len(service_ports) == 0:
+            return False, evidence + [
+                f"Service {service_name} has no exposed ports. Route creation was rejected."
+            ]
+
+        if len(service_ports) > 1:
+            return False, evidence + [
+                f"Service {service_name} has multiple ports. Manual intervention is required."
+            ]
+
+        service_port = service_ports[0]
+        target_port = service_port.name if service_port.name else service_port.port
+
+        route_body = {
+            "apiVersion": "route.openshift.io/v1",
+            "kind": "Route",
+            "metadata": {
+                "name": service_name,
+                "namespace": namespace,
+                "labels": {
+                    "app": application,
+                    "managed-by": "ai-copilot"
+                }
+            },
+            "spec": {
+                "to": {
+                    "kind": "Service",
+                    "name": service_name,
+                    "weight": 100
+                },
+                "port": {
+                    "targetPort": target_port
+                },
+                "wildcardPolicy": "None"
+            }
+        }
+
+        custom_api.create_namespaced_custom_object(
+            group="route.openshift.io",
+            version="v1",
+            namespace=namespace,
+            plural="routes",
+            body=route_body
+        )
+
+        evidence.append(
+            f"Executed correction: created route/{service_name} for service/{service_name}."
+        )
+
+        route = custom_api.get_namespaced_custom_object(
+            group="route.openshift.io",
+            version="v1",
+            namespace=namespace,
+            plural="routes",
+            name=service_name
+        )
+
+        host = route.get("spec", {}).get("host", "host not assigned yet")
+
+        evidence.append(f"Route {service_name} exists after correction.")
+        evidence.append(f"Route host: {host}")
+
+        return True, evidence
+
+    except ApiException as error:
+        if error.status == 409:
+            return False, evidence + [
+                f"Route {service_name} already exists, but it was not detected as a valid route for this service."
+            ]
+
+        return False, evidence + [
+            f"Failed to create route for service {service_name}: {error.reason}"
+        ]
+
+
 def get_service_account_token() -> str:
     with open(SERVICE_ACCOUNT_TOKEN_PATH, "r", encoding="utf-8") as token_file:
         return token_file.read().strip()
@@ -836,27 +930,10 @@ def diagnose(request: DiagnoseRequest):
             )
 
         if pod_not_ready_detected:
-            deployment_name = get_first_matching_deployment_name(
-                apps_api=apps_v1,
-                namespace=request.namespace,
-                application=request.application,
-                pods=pods
+            auto_fix = manual_auto_fix(
+                "The pod is running but not ready. This may be caused by a readiness probe, "
+                "wrong port, slow startup or application-level issue. Automatic correction is not safe."
             )
-
-            if deployment_name:
-                auto_fix = available_auto_fix(
-                    action="restart_deployment",
-                    target_kind="deployment",
-                    target_name=deployment_name,
-                    reason=(
-                        "The pod is running but not ready, and a matching deployment was found. "
-                        "The Copilot can try a safe deployment restart without changing configuration."
-                    )
-                )
-            else:
-                auto_fix = manual_auto_fix(
-                    "The pod is not ready, but no matching deployment was found. Automatic correction is not safe."
-                )
 
             return DiagnoseResponse(
                 status="Application degraded",
@@ -1016,6 +1093,23 @@ def diagnose(request: DiagnoseRequest):
         )
 
         if not routes:
+            if len(services) == 1:
+                selected_service = services[0]
+                route_auto_fix = available_auto_fix(
+                    action="create_route_for_service",
+                    target_kind="service",
+                    target_name=selected_service.metadata.name,
+                    reason=(
+                        "The application pods are ready, a service exists and has endpoints, "
+                        "but no OpenShift route was found. The Copilot can safely create a route "
+                        "for the detected service."
+                    )
+                )
+            else:
+                route_auto_fix = manual_auto_fix(
+                    "Multiple matching services were found. Automatic route creation is not safe."
+                )
+
             return DiagnoseResponse(
                 status="Application unavailable",
                 probable_cause="No route found for the application",
@@ -1033,7 +1127,8 @@ def diagnose(request: DiagnoseRequest):
                 ],
                 evidence=evidence + [
                     f"No route found for application {request.application}."
-                ]
+                ],
+                auto_fix=route_auto_fix
             )
 
         evidence.append(
@@ -1141,8 +1236,8 @@ def auto_fix(request: AutoFixRequest):
     evidence = []
 
     allowed_actions = [
-        "restart_deployment",
-        "scale_deployment_to_one"
+        "scale_deployment_to_one",
+        "create_route_for_service"
     ]
 
     try:
@@ -1166,23 +1261,14 @@ def auto_fix(request: AutoFixRequest):
             status="Rejected",
             resolution_status="unresolved",
             flag_label="Unresolved",
-            message="This action is not allowed for automatic correction.",
+            message=(
+                "This action is not allowed for automatic correction. "
+                "Only safe actions are allowed: scale_deployment_to_one and create_route_for_service."
+            ),
             executed_action=request.action,
             target_kind=request.target_kind,
             target_name=request.target_name,
             evidence=[f"Rejected action: {request.action}"]
-        )
-
-    if request.target_kind != "deployment":
-        return AutoFixResponse(
-            status="Rejected",
-            resolution_status="unresolved",
-            flag_label="Unresolved",
-            message="Automatic correction is only allowed for deployments.",
-            executed_action=request.action,
-            target_kind=request.target_kind,
-            target_name=request.target_name,
-            evidence=[f"Rejected target kind: {request.target_kind}"]
         )
 
     try:
@@ -1191,6 +1277,7 @@ def auto_fix(request: AutoFixRequest):
 
         v1 = client.CoreV1Api()
         apps_v1 = client.AppsV1Api()
+        custom_api = client.CustomObjectsApi()
 
         pods = find_application_pods(
             v1_api=v1,
@@ -1198,46 +1285,58 @@ def auto_fix(request: AutoFixRequest):
             application=request.application
         )
 
-        matching_deployments = find_application_deployments(
-            apps_api=apps_v1,
-            namespace=request.namespace,
-            application=request.application,
-            pods=pods
-        )
+        if request.action == "scale_deployment_to_one":
+            if request.target_kind != "deployment":
+                return AutoFixResponse(
+                    status="Rejected",
+                    resolution_status="unresolved",
+                    flag_label="Unresolved",
+                    message="Scale correction is only allowed for deployment targets.",
+                    executed_action=request.action,
+                    target_kind=request.target_kind,
+                    target_name=request.target_name,
+                    evidence=evidence + [f"Rejected target kind: {request.target_kind}"]
+                )
 
-        matching_deployment_names = [
-            deployment.metadata.name
-            for deployment in matching_deployments
-        ]
-
-        if request.target_name not in matching_deployment_names:
-            return AutoFixResponse(
-                status="Rejected",
-                resolution_status="unresolved",
-                flag_label="Unresolved",
-                message=(
-                    "The requested deployment does not match the diagnosed application. "
-                    "Automatic correction was rejected for safety."
-                ),
-                executed_action=request.action,
-                target_kind=request.target_kind,
-                target_name=request.target_name,
-                evidence=evidence + [
-                    f"Requested target: {request.target_name}",
-                    f"Matching deployments for application {request.application}: {matching_deployment_names}"
-                ]
+            matching_deployments = find_application_deployments(
+                apps_api=apps_v1,
+                namespace=request.namespace,
+                application=request.application,
+                pods=pods
             )
 
-        deployment = apps_v1.read_namespaced_deployment(
-            name=request.target_name,
-            namespace=request.namespace
-        )
+            matching_deployment_names = [
+                deployment.metadata.name
+                for deployment in matching_deployments
+            ]
 
-        evidence.append(
-            f"Deployment found before correction: {deployment.metadata.name}"
-        )
+            if request.target_name not in matching_deployment_names:
+                return AutoFixResponse(
+                    status="Rejected",
+                    resolution_status="unresolved",
+                    flag_label="Unresolved",
+                    message=(
+                        "The requested deployment does not match the diagnosed application. "
+                        "Automatic correction was rejected for safety."
+                    ),
+                    executed_action=request.action,
+                    target_kind=request.target_kind,
+                    target_name=request.target_name,
+                    evidence=evidence + [
+                        f"Requested target: {request.target_name}",
+                        f"Matching deployments for application {request.application}: {matching_deployment_names}"
+                    ]
+                )
 
-        if request.action == "scale_deployment_to_one":
+            deployment = apps_v1.read_namespaced_deployment(
+                name=request.target_name,
+                namespace=request.namespace
+            )
+
+            evidence.append(
+                f"Deployment found before correction: {deployment.metadata.name}"
+            )
+
             current_replicas = deployment.spec.replicas or 0
 
             evidence.append(
@@ -1273,21 +1372,117 @@ def auto_fix(request: AutoFixRequest):
                 f"Executed correction: scaled deployment/{request.target_name} to 1 replica."
             )
 
-        elif request.action == "restart_deployment":
-            desired_replicas = deployment.spec.replicas or 0
-
-            evidence.append(
-                f"Current desired replicas for deployment {request.target_name}: {desired_replicas}"
+            recovered, verification_evidence = verify_deployment_recovered(
+                apps_api=apps_v1,
+                v1_api=v1,
+                namespace=request.namespace,
+                deployment_name=request.target_name,
+                timeout_seconds=90
             )
 
-            if desired_replicas == 0:
+            evidence.extend(verification_evidence)
+
+            if recovered:
+                return AutoFixResponse(
+                    status="Auto-fix completed",
+                    resolution_status="resolved",
+                    flag_label="Resolved",
+                    message="Automatic correction completed successfully. The deployment is now healthy.",
+                    executed_action=request.action,
+                    target_kind=request.target_kind,
+                    target_name=request.target_name,
+                    evidence=evidence
+                )
+
+            return AutoFixResponse(
+                status="Auto-fix executed but not resolved",
+                resolution_status="unresolved",
+                flag_label="Unresolved",
+                message=(
+                    "The automatic correction was executed, but the deployment did not become healthy "
+                    "within the verification timeout."
+                ),
+                executed_action=request.action,
+                target_kind=request.target_kind,
+                target_name=request.target_name,
+                evidence=evidence
+            )
+
+        if request.action == "create_route_for_service":
+            if request.target_kind != "service":
+                return AutoFixResponse(
+                    status="Rejected",
+                    resolution_status="unresolved",
+                    flag_label="Unresolved",
+                    message="Route creation is only allowed for service targets.",
+                    executed_action=request.action,
+                    target_kind=request.target_kind,
+                    target_name=request.target_name,
+                    evidence=evidence + [f"Rejected target kind: {request.target_kind}"]
+                )
+
+            if not pods:
+                return AutoFixResponse(
+                    status="Rejected",
+                    resolution_status="unresolved",
+                    flag_label="Unresolved",
+                    message="No application pods were found. Route creation was rejected for safety.",
+                    executed_action=request.action,
+                    target_kind=request.target_kind,
+                    target_name=request.target_name,
+                    evidence=evidence + [
+                        f"No pods found for application {request.application}."
+                    ]
+                )
+
+            services = find_application_services(
+                v1_api=v1,
+                namespace=request.namespace,
+                application=request.application,
+                pods=pods
+            )
+
+            matching_service_names = [
+                service.metadata.name
+                for service in services
+            ]
+
+            if request.target_name not in matching_service_names:
                 return AutoFixResponse(
                     status="Rejected",
                     resolution_status="unresolved",
                     flag_label="Unresolved",
                     message=(
-                        "The deployment has zero replicas. Restart is not useful. "
-                        "Use scale correction instead."
+                        "The requested service does not match the diagnosed application. "
+                        "Automatic route creation was rejected for safety."
+                    ),
+                    executed_action=request.action,
+                    target_kind=request.target_kind,
+                    target_name=request.target_name,
+                    evidence=evidence + [
+                        f"Requested target: {request.target_name}",
+                        f"Matching services for application {request.application}: {matching_service_names}"
+                    ]
+                )
+
+            endpoint_count = get_service_endpoint_count(
+                v1_api=v1,
+                namespace=request.namespace,
+                service_name=request.target_name
+            )
+
+            evidence.append(
+                f"Service {request.target_name} endpoint count before route creation: {endpoint_count}"
+            )
+
+            if endpoint_count == 0:
+                return AutoFixResponse(
+                    status="Rejected",
+                    resolution_status="unresolved",
+                    flag_label="Unresolved",
+                    message=(
+                        "The service has no endpoints. Creating a route would not restore access, "
+                        "so automatic correction was rejected for safety."
                     ),
                     executed_action=request.action,
                     target_kind=request.target_kind,
@@ -1295,66 +1490,66 @@ def auto_fix(request: AutoFixRequest):
                     evidence=evidence
                 )
 
-            restarted_at = datetime.now(timezone.utc).isoformat()
-
-            patch_body = {
-                "spec": {
-                    "template": {
-                        "metadata": {
-                            "annotations": {
-                                "ai-copilot/restarted-at": restarted_at
-                            }
-                        }
-                    }
-                }
-            }
-
-            apps_v1.patch_namespaced_deployment(
-                name=request.target_name,
+            existing_routes = find_application_routes(
+                custom_api=custom_api,
                 namespace=request.namespace,
-                body=patch_body
+                application=request.application,
+                services=services
             )
 
-            evidence.append(
-                f"Executed correction: restarted deployment/{request.target_name} "
-                f"using annotation ai-copilot/restarted-at={restarted_at}."
+            route_already_exists = any(
+                route.get("spec", {}).get("to", {}).get("name", "") == request.target_name
+                for route in existing_routes
             )
 
-        recovered, verification_evidence = verify_deployment_recovered(
-            apps_api=apps_v1,
-            v1_api=v1,
-            namespace=request.namespace,
-            deployment_name=request.target_name,
-            timeout_seconds=90
-        )
+            if route_already_exists:
+                return AutoFixResponse(
+                    status="Skipped",
+                    resolution_status="resolved",
+                    flag_label="Resolved",
+                    message="A route already exists for this service. No correction was needed.",
+                    executed_action=request.action,
+                    target_kind=request.target_kind,
+                    target_name=request.target_name,
+                    evidence=evidence + [
+                        f"Existing route found for service/{request.target_name}."
+                    ]
+                )
 
-        evidence.extend(verification_evidence)
+            recovered, route_evidence = create_route_for_service(
+                custom_api=custom_api,
+                v1_api=v1,
+                namespace=request.namespace,
+                application=request.application,
+                service_name=request.target_name
+            )
 
-        if recovered:
+            evidence.extend(route_evidence)
+
+            if recovered:
+                return AutoFixResponse(
+                    status="Auto-fix completed",
+                    resolution_status="resolved",
+                    flag_label="Resolved",
+                    message="Automatic correction completed successfully. The route was created.",
+                    executed_action=request.action,
+                    target_kind=request.target_kind,
+                    target_name=request.target_name,
+                    evidence=evidence
+                )
+
             return AutoFixResponse(
-                status="Auto-fix completed",
-                resolution_status="resolved",
-                flag_label="Resolved",
-                message="Automatic correction completed successfully. The deployment is now healthy.",
+                status="Auto-fix executed but not resolved",
+                resolution_status="unresolved",
+                flag_label="Unresolved",
+                message=(
+                    "The automatic correction was attempted, but the route could not be verified."
+                ),
                 executed_action=request.action,
                 target_kind=request.target_kind,
                 target_name=request.target_name,
                 evidence=evidence
             )
-
-        return AutoFixResponse(
-            status="Auto-fix executed but not resolved",
-            resolution_status="unresolved",
-            flag_label="Unresolved",
-            message=(
-                "The automatic correction was executed, but the deployment did not become healthy "
-                "within the verification timeout."
-            ),
-            executed_action=request.action,
-            target_kind=request.target_kind,
-            target_name=request.target_name,
-            evidence=evidence
-        )
 
     except ApiException as api_error:
         return AutoFixResponse(
