@@ -122,6 +122,10 @@ PROMETHEUS_URL = os.getenv(
 
 SERVICE_ACCOUNT_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 
+ALERTMANAGER_URL = os.getenv(
+    "ALERTMANAGER_URL",
+    "https://alertmanager-main-openshift-monitoring.apps.sno.fedora.test"
+)
 
 def validate_k8s_name(value: str, field_name: str) -> str:
     pattern = r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
@@ -491,6 +495,18 @@ def query_prometheus(query: str) -> dict:
     response.raise_for_status()
     return response.json()
 
+def query_alertmanager() -> list:
+    token = get_service_account_token()
+
+    response = requests.get(
+        f"{ALERTMANAGER_URL}/api/v2/alerts",
+        headers={"Authorization": f"Bearer {token}"},
+        verify=False,
+        timeout=10
+    )
+
+    response.raise_for_status()
+    return response.json()
 
 def convert_time_window_to_prometheus(time_window: str) -> str:
     match = re.search(r"\d+", time_window)
