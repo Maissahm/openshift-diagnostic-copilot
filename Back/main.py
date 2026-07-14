@@ -682,7 +682,73 @@ def collect_prometheus_evidence(namespace: str, pods: list, time_window: str) ->
 
     return prometheus_evidence
 
+def collect_alertmanager_evidence(namespace: str, application: str, pods: list) -> list[str]:
+    alertmanager_evidence = []
 
+    pod_names = [
+        pod.metadata.name
+        for pod in pods
+        if pod.metadata and pod.metadata.name
+    ]
+
+    try:
+        alerts = query_alertmanager()
+
+        matching_alerts = []
+
+        for alert in alerts:
+            labels = alert.get("labels", {})
+            annotations = alert.get("annotations", {})
+            status = alert.get("status", {})
+
+            alert_namespace = labels.get("namespace", "")
+            alert_pod = labels.get("pod", "")
+            alert_name = labels.get("alertname", "unknown-alert")
+            severity = labels.get("severity", "unknown")
+            state = status.get("state", "unknown")
+
+            namespace_matches = alert_namespace == namespace
+            pod_matches = alert_pod in pod_names
+            application_matches = (
+                application.lower() in str(labels).lower()
+                or application.lower() in str(annotations).lower()
+            )
+
+            if namespace_matches and (pod_matches or application_matches):
+                matching_alerts.append(alert)
+
+        if not matching_alerts:
+            alertmanager_evidence.append(
+                f"Alertmanager: no active alert found for application {application} "
+                f"in namespace {namespace}."
+            )
+            return alertmanager_evidence
+
+        for alert in matching_alerts:
+            labels = alert.get("labels", {})
+            annotations = alert.get("annotations", {})
+            status = alert.get("status", {})
+
+            alert_name = labels.get("alertname", "unknown-alert")
+            severity = labels.get("severity", "unknown")
+            pod_name = labels.get("pod", "unknown-pod")
+            state = status.get("state", "unknown")
+            summary = annotations.get(
+                "summary",
+                annotations.get("message", "No summary provided")
+            )
+
+            alertmanager_evidence.append(
+                f"Alertmanager: active alert {alert_name} detected. "
+                f"Severity={severity}, state={state}, pod={pod_name}, summary={summary}"
+            )
+
+    except Exception as error:
+        alertmanager_evidence.append(
+            f"Alertmanager: alerts could not be collected. Error: {str(error)}"
+        )
+
+    return alertmanager_evidence
 @app.get("/")
 def root():
     return {
@@ -880,6 +946,14 @@ def diagnose(request: DiagnoseRequest):
         )
 
         evidence.extend(prometheus_evidence)
+
+        alertmanager_evidence = collect_alertmanager_evidence(
+            namespace=request.namespace,
+             application=request.application,
+             pods=pods
+)
+
+        evidence.extend(alertmanager_evidence)
 
         if image_pull_issue_detected:
             return DiagnoseResponse(
